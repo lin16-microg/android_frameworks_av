@@ -18,6 +18,7 @@
 #define ANDROID_AUDIO_FAST_MIXER_H
 
 #include <atomic>
+#include <audio_utils/Balance.h>
 #include "FastThread.h"
 #include "StateQueue.h"
 #include "FastMixerState.h"
@@ -38,6 +39,8 @@ public:
             FastMixerStateQueue* sq();
 
     virtual void setMasterMono(bool mono) { mMasterMono.store(mono); /* memory_order_seq_cst */ }
+    virtual void setMasterBalance(float balance) { mMasterBalance.store(balance); }
+    virtual float getMasterBalance() const { return mMasterBalance.load(); }
     virtual void setBoottimeOffset(int64_t boottimeOffset) {
         mBoottimeOffset.store(boottimeOffset); /* memory_order_seq_cst */
     }
@@ -71,7 +74,7 @@ private:
     audio_channel_mask_t mSinkChannelMask;
     void*           mMixerBuffer;       // mixer output buffer.
     size_t          mMixerBufferSize;
-    audio_format_t  mMixerBufferFormat; // mixer output format: AUDIO_FORMAT_PCM_(16_BIT|FLOAT).
+    static constexpr audio_format_t mMixerBufferFormat = AUDIO_FORMAT_PCM_FLOAT;
 
     enum {UNDEFINED, MIXED, ZEROED} mMixerBufferState;
     NBAIO_Format    mFormat;
@@ -84,8 +87,11 @@ private:
     ExtendedTimestamp mTimestamp;
     int64_t         mNativeFramesWrittenButNotPresented;
 
+    audio_utils::Balance mBalance;
+
     // accessed without lock between multiple threads.
     std::atomic_bool mMasterMono;
+    std::atomic<float> mMasterBalance{};
     std::atomic_int_fast64_t mBoottimeOffset;
 };  // class FastMixer
 

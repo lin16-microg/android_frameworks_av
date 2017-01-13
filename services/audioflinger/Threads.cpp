@@ -36,6 +36,7 @@
 
 #include <private/media/AudioTrackShared.h>
 #include <private/android_filesystem_config.h>
+#include <audio_utils/Balance.h>
 #include <audio_utils/mono_blend.h>
 #include <audio_utils/primitives.h>
 #include <audio_utils/format.h>
@@ -2251,6 +2252,11 @@ void AudioFlinger::PlaybackThread::setMasterVolume(float value)
     }
 }
 
+void AudioFlinger::PlaybackThread::setMasterBalance(float balance)
+{
+    mMasterBalance.store(balance);
+}
+
 void AudioFlinger::PlaybackThread::setMasterMute(bool muted)
 {
     if (isDuplicating()) {
@@ -2476,6 +2482,7 @@ void AudioFlinger::PlaybackThread::readOutputParameters_l()
                 mChannelMask);
     }
     mChannelCount = audio_channel_count_from_out_mask(mChannelMask);
+    mBalance.setChannelMask(mChannelMask);
 
     // Get actual HAL format.
     status_t result = mOutput->stream->getFormat(&mHALFormat);
@@ -2595,7 +2602,7 @@ void AudioFlinger::PlaybackThread::readOutputParameters_l()
     free(mMixerBuffer);
     mMixerBuffer = NULL;
     if (mMixerBufferEnabled) {
-        mMixerBufferFormat = AUDIO_FORMAT_PCM_FLOAT; // also valid: AUDIO_FORMAT_PCM_16_BIT.
+        mMixerBufferFormat = AUDIO_FORMAT_PCM_FLOAT; // no longer valid: AUDIO_FORMAT_PCM_16_BIT.
         mMixerBufferSize = mNormalFrameCount * mChannelCount
                 * audio_bytes_per_sample(mMixerBufferFormat);
         (void)posix_memalign(&mMixerBuffer, 32, mMixerBufferSize);
@@ -3389,6 +3396,14 @@ bool AudioFlinger::PlaybackThread::threadLoop()
                                true /*limit*/);
                 }
 
+                if (!hasFastMixer()) {
+                    // Balance must take effect after mono conversion.
+                    // We do it here if there is no FastMixer.
+                    // mBalance detects zero balance within the class for speed (not needed here).
+                    mBalance.setBalance(mMasterBalance.load());
+                    mBalance.process((float *)mMixerBuffer, mNormalFrameCount);
+                }
+
                 memcpy_by_audio_format(buffer, format, mMixerBuffer, mMixerBufferFormat,
                         mNormalFrameCount * mChannelCount);
             }
@@ -3431,6 +3446,14 @@ bool AudioFlinger::PlaybackThread::threadLoop()
             if (requireMonoBlend()) {
                 mono_blend(mEffectBuffer, mEffectBufferFormat, mChannelCount, mNormalFrameCount,
                            true /*limit*/);
+            }
+
+            if (!hasFastMixer()) {
+                // Balance must take effect after mono conversion.
+                // We do it here if there is no FastMixer.
+                // mBalance detects zero balance within the class for speed (not needed here).
+                mBalance.setBalance(mMasterBalance.load());
+                mBalance.process((float *)mEffectBuffer, mNormalFrameCount);
             }
 
             memcpy_by_audio_format(mSinkBuffer, mFormat, mEffectBuffer, mEffectBufferFormat,
@@ -3793,6 +3816,7 @@ AudioFlinger::MixerThread::MixerThread(const sp<AudioFlinger>& audioFlinger, Aud
         // mPipeSink below
         // mNormalSink below
 {
+    setMasterBalance(audioFlinger->getMasterBalance_l());
     ALOGV("MixerThread() id=%d device=%#x type=%d", id, device, type);
     ALOGV("mSampleRate=%u, mChannelMask=%#x, mChannelCount=%u, mFormat=%#x, mFrameSize=%zu, "
             "mFrameCount=%zu, mNormalFrameCount=%zu",
@@ -5025,7 +5049,9 @@ void AudioFlinger::MixerThread::dumpInternals(int fd, const Vector<String16>& ar
     dprintf(fd, "  Thread throttle time (msecs): %u\n", mThreadThrottleTimeMs);
     dprintf(fd, "  AudioMixer tracks: %s\n", mAudioMixer->trackNames().c_str());
     dprintf(fd, "  Master mono: %s\n", mMasterMono ? "on" : "off");
-
+    dprintf(fd, "  Master balance: %f (%s)\n", mMasterBalance.load(),
+            (hasFastMixer() ? std::to_string(mFastMixer->getMasterBalance())
+                            : mBalance.toString()).c_str());
     if (hasFastMixer()) {
         dprintf(fd, "  FastMixer thread %p tid=%d", mFastMixer.get(), mFastMixer->getTid());
 
@@ -5099,10 +5125,28 @@ AudioFlinger::DirectOutputThread::DirectOutputThread(const sp<AudioFlinger>& aud
     :   PlaybackThread(audioFlinger, output, id, device, type, systemReady)
         , mVolumeShaperActive(false)
 {
+    setMasterBalance(audioFlinger->getMasterBalance_l());
 }
 
 AudioFlinger::DirectOutputThread::~DirectOutputThread()
 {
+}
+
+void AudioFlinger::DirectOutputThread::dumpInternals(int fd, const Vector<String16>& args)
+{
+    PlaybackThread::dumpInternals(fd, args);
+    dprintf(fd, "  Master balance: %f  Left: %f  Right: %f\n",
+            mMasterBalance.load(), mMasterBalanceLeft, mMasterBalanceRight);
+}
+
+void AudioFlinger::DirectOutputThread::setMasterBalance(float balance)
+{
+    Mutex::Autolock _l(mLock);
+    if (mMasterBalance != balance) {
+        mMasterBalance.store(balance);
+        mBalance.computeStereoBalance(balance, &mMasterBalanceLeft, &mMasterBalanceRight);
+        broadcast_l();
+    }
 }
 
 void AudioFlinger::DirectOutputThread::processVolume_l(Track *track, bool lastTrack)
@@ -5128,12 +5172,12 @@ void AudioFlinger::DirectOutputThread::processVolume_l(Track *track, bool lastTr
         if (left > GAIN_FLOAT_UNITY) {
             left = GAIN_FLOAT_UNITY;
         }
-        left *= v;
+        left *= v * mMasterBalanceLeft; // DirectOutputThread balance applied as track volume
         right = float_from_gain(gain_minifloat_unpack_right(vlr));
         if (right > GAIN_FLOAT_UNITY) {
             right = GAIN_FLOAT_UNITY;
         }
-        right *= v;
+        right *= v * mMasterBalanceRight;
     }
 
     if (lastTrack) {
